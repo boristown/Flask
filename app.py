@@ -1,4 +1,5 @@
 from flask import Flask, request, Response, jsonify
+from gsearch.googlesearch import search as google_search
 import os
 import requests
 
@@ -93,25 +94,27 @@ def search():
     if not query:
         return jsonify(error="missing q"), 400
 
-    timeout = float(os.getenv("SEARCH_TIMEOUT", "20"))
-    user_agent = os.getenv(
-        "SEARCH_UA",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
-    )
+    num_results = request.args.get("num_results")
+    if request.is_json and num_results is None:
+        payload = request.get_json(silent=True) or {}
+        num_results = payload.get("num_results")
+    elif num_results is None:
+        num_results = request.form.get("num_results")
+
+    if num_results is None:
+        num_results = int(os.getenv("SEARCH_RESULTS", "10"))
+    else:
+        try:
+            num_results = int(num_results)
+        except (TypeError, ValueError):
+            return jsonify(error="invalid num_results"), 400
 
     try:
-        upstream = requests.get(
-            "https://api.duckduckgo.com/",
-            params={"q": query, "format": "json", "no_redirect": "1", "no_html": "1"},
-            headers={"User-Agent": user_agent},
-            timeout=timeout,
-        )
-    except requests.RequestException as exc:
+        results = google_search(query, num_results=num_results)
+    except Exception as exc:
         return jsonify(error="search request failed", details=str(exc)), 502
 
-    response_headers = _filter_headers(upstream.headers)
-    response_headers["Content-Type"] = "application/json; charset=utf-8"
-    return Response(upstream.content, status=upstream.status_code, headers=response_headers)
+    return jsonify(results=results)
 
 
 if __name__ == "__main__":
