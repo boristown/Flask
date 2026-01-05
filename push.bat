@@ -2,6 +2,7 @@
 setlocal
 
 set msg=%*
+set msg=%msg:"=%
 if "%msg%"=="" (
   for /f "delims=" %%i in ('powershell -NoProfile -Command "Get-Date -Format \"yyyy-MM-dd HH:mm:ss\""' ) do set msg=sync %%i
 )
