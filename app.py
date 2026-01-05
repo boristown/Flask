@@ -1,5 +1,7 @@
 from flask import Flask, request, Response, jsonify
 from gsearch.googlesearch import search as google_search
+from urllib.parse import urlparse, parse_qs, quote_plus
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 import os
 import requests
 
@@ -19,6 +21,74 @@ HOP_BY_HOP_HEADERS = {
 
 def _filter_headers(headers):
     return {k: v for k, v in headers.items() if k.lower() not in HOP_BY_HOP_HEADERS}
+
+
+def _extract_google_result_url(href):
+    if not href:
+        return None
+    if href.startswith("/url?"):
+        query = parse_qs(urlparse(href).query)
+        if "q" in query and query["q"]:
+            return query["q"][0]
+        return None
+    if href.startswith("http://") or href.startswith("https://"):
+        return href
+    return None
+
+
+def _search_with_playwright(query, num_results, timeout, user_agent):
+    timeout_ms = int(timeout * 1000)
+    encoded_query = quote_plus(query)
+    url = f"https://www.google.com/search?q={encoded_query}&num={num_results}&hl=en&gl=us"
+    results = []
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        context = browser.new_context(
+            user_agent=user_agent,
+            locale="en-US",
+            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+        )
+        context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+        )
+        context.add_init_script("window.chrome = { runtime: {} };")
+        page = context.new_page()
+        page.set_default_timeout(timeout_ms)
+        page.goto(url, wait_until="domcontentloaded")
+        for selector in ("button#L2AGLb", "button:has-text('I agree')", "button:has-text('Accept all')"):
+            try:
+                if page.locator(selector).first.is_visible(timeout=1000):
+                    page.locator(selector).first.click()
+                    break
+            except PlaywrightTimeoutError:
+                pass
+
+        try:
+            page.wait_for_selector("a h3", timeout=5000)
+        except PlaywrightTimeoutError:
+            pass
+
+        html = page.content()
+        if "unusual traffic" in html.lower() or "recaptcha" in html.lower():
+            raise RuntimeError("google blocked automated traffic (captcha)")
+
+        items = page.eval_on_selector_all(
+            "a h3",
+            "els => els.map(el => ({title: el.innerText, href: el.closest('a') ? el.closest('a').getAttribute('href') : ''}))",
+        )
+        for item in items:
+            title = (item.get("title") or "").strip()
+            href = _extract_google_result_url(item.get("href"))
+            if title and href:
+                results.append((title, href))
+        context.close()
+        browser.close()
+
+    return results
 
 
 @app.route("/health", methods=["GET"])
@@ -110,7 +180,14 @@ def search():
             return jsonify(error="invalid num_results"), 400
 
     try:
-        results = google_search(query, num_results=num_results)
+        timeout = float(os.getenv("SEARCH_TIMEOUT", "20"))
+        user_agent = os.getenv(
+            "SEARCH_UA",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+        )
+        results = _search_with_playwright(query, num_results, timeout, user_agent)
+        if not results:
+            results = google_search(query, num_results=num_results)
     except Exception as exc:
         return jsonify(error="search request failed", details=str(exc)), 502
 
