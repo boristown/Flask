@@ -194,6 +194,40 @@ def search():
     return jsonify(results=results)
 
 
+@app.route("/fetch", methods=["GET", "POST"])
+def fetch():
+    target_url = request.args.get("url")
+    if request.is_json and not target_url:
+        payload = request.get_json(silent=True) or {}
+        target_url = payload.get("url")
+    elif not target_url:
+        target_url = request.form.get("url")
+
+    if not target_url:
+        return jsonify(error="missing url"), 400
+
+    timeout = float(os.getenv("FETCH_TIMEOUT", "20"))
+    verify = os.getenv("FETCH_VERIFY", "true").lower() not in {"0", "false", "no"}
+    user_agent = os.getenv(
+        "FETCH_UA",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+    )
+
+    try:
+        upstream = requests.get(
+            target_url,
+            headers={"User-Agent": user_agent},
+            timeout=timeout,
+            allow_redirects=True,
+            verify=verify,
+        )
+    except requests.RequestException as exc:
+        return jsonify(error="fetch failed", details=str(exc)), 502
+
+    response_headers = {"Content-Type": "text/html; charset=utf-8"}
+    return Response(upstream.text, status=upstream.status_code, headers=response_headers)
+
+
 if __name__ == "__main__":
     host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", "9443"))
