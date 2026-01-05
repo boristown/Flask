@@ -2,10 +2,16 @@ from flask import Flask, request, Response, jsonify
 from gsearch.googlesearch import search as google_search
 from urllib.parse import urlparse, parse_qs, quote_plus
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from datetime import datetime
+import json
 import os
 import requests
+import subprocess
+import sys
 
 app = Flask(__name__)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_DIR = os.path.join(BASE_DIR, "log")
 
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -34,6 +40,81 @@ def _extract_google_result_url(href):
     if href.startswith("http://") or href.startswith("https://"):
         return href
     return None
+
+
+def _log_api(api_name, status_code, detail=None):
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        timestamp = datetime.utcnow().isoformat() + "Z"
+        remote = request.headers.get("X-Forwarded-For", request.remote_addr)
+        path = request.full_path.rstrip("?")
+        line = f"{timestamp}\t{remote}\t{request.method}\t{path}\t{status_code}"
+        if detail:
+            line = f"{line}\t{detail}"
+        log_path = os.path.join(LOG_DIR, f"{api_name}.txt")
+        with open(log_path, "a", encoding="utf-8") as handle:
+            handle.write(f"{line}\n")
+    except Exception:
+        pass
+
+
+def _run_python_sandbox(code, stdin_data, timeout):
+    harness = (
+        "import json, sys, io, builtins, traceback\n"
+        "payload = json.load(sys.stdin)\n"
+        "code = payload.get('code') or ''\n"
+        "stdin_data = payload.get('stdin') or ''\n"
+        "allowed_modules = {'math','random','statistics','re','datetime','decimal','fractions','itertools','functools'}\n"
+        "safe_builtins = {\n"
+        "  'abs': builtins.abs, 'all': builtins.all, 'any': builtins.any,\n"
+        "  'bool': builtins.bool, 'dict': builtins.dict, 'float': builtins.float,\n"
+        "  'int': builtins.int, 'len': builtins.len, 'list': builtins.list,\n"
+        "  'max': builtins.max, 'min': builtins.min, 'print': builtins.print,\n"
+        "  'range': builtins.range, 'str': builtins.str, 'sum': builtins.sum,\n"
+        "  'enumerate': builtins.enumerate, 'zip': builtins.zip, 'set': builtins.set,\n"
+        "  'tuple': builtins.tuple, 'sorted': builtins.sorted, 'repr': builtins.repr,\n"
+        "  'input': builtins.input,\n"
+        "  'Exception': builtins.Exception, 'ValueError': builtins.ValueError,\n"
+        "  'TypeError': builtins.TypeError, 'KeyError': builtins.KeyError,\n"
+        "  'IndexError': builtins.IndexError, 'ZeroDivisionError': builtins.ZeroDivisionError,\n"
+        "}\n"
+        "def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):\n"
+        "  if name in allowed_modules:\n"
+        "    return __import__(name, globals, locals, fromlist, level)\n"
+        "  raise ImportError(f\"import of '{name}' is blocked\")\n"
+        "safe_builtins['__import__'] = guarded_import\n"
+        "sys.stdin = io.StringIO(stdin_data)\n"
+        "sandbox_globals = {'__builtins__': safe_builtins, '__name__': '__main__'}\n"
+        "try:\n"
+        "  exec(compile(code, '<sandbox>', 'exec'), sandbox_globals, None)\n"
+        "except SystemExit:\n"
+        "  raise\n"
+        "except Exception:\n"
+        "  traceback.print_exc()\n"
+    )
+
+    payload = json.dumps({"code": code, "stdin": stdin_data or ""})
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-I", "-S", "-u", "-c", harness],
+            input=payload,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+        )
+        return {
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+            "returncode": completed.returncode,
+            "timed_out": False,
+        }
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "stdout": exc.stdout or "",
+            "stderr": (exc.stderr or "") + "sandbox timeout\n",
+            "returncode": 124,
+            "timed_out": True,
+        }
 
 
 def _search_with_playwright(query, num_results, timeout, user_agent):
@@ -91,9 +172,11 @@ def _search_with_playwright(query, num_results, timeout, user_agent):
     return results
 
 
-@app.route("/health", methods=["GET"])
+@app.route("/health", methods=["GET", "POST"])
 def health():
-    return jsonify(status="ok")
+    response = jsonify(status="ok")
+    _log_api("health", response.status_code)
+    return response
 
 
 @app.route("/proxy", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"])
@@ -109,6 +192,7 @@ def proxy():
         target_url = request.form.get("url")
 
     if not target_url:
+        _log_api("proxy", 400, "missing url")
         return jsonify(error="missing url"), 400
 
     method = (payload.get("method") if isinstance(payload, dict) else None) or request.method
@@ -146,10 +230,13 @@ def proxy():
             verify=verify,
         )
     except requests.RequestException as exc:
+        _log_api("proxy", 502, "upstream request failed")
         return jsonify(error="upstream request failed", details=str(exc)), 502
 
     response_headers = _filter_headers(upstream.headers)
-    return Response(upstream.content, status=upstream.status_code, headers=response_headers)
+    response = Response(upstream.content, status=upstream.status_code, headers=response_headers)
+    _log_api("proxy", response.status_code)
+    return response
 
 
 @app.route("/search", methods=["GET", "POST"])
@@ -162,6 +249,7 @@ def search():
         query = request.form.get("q")
 
     if not query:
+        _log_api("search", 400, "missing q")
         return jsonify(error="missing q"), 400
 
     num_results = request.args.get("num_results")
@@ -177,6 +265,7 @@ def search():
         try:
             num_results = int(num_results)
         except (TypeError, ValueError):
+            _log_api("search", 400, "invalid num_results")
             return jsonify(error="invalid num_results"), 400
 
     try:
@@ -189,9 +278,12 @@ def search():
         if not results:
             results = google_search(query, num_results=num_results)
     except Exception as exc:
+        _log_api("search", 502, "search request failed")
         return jsonify(error="search request failed", details=str(exc)), 502
 
-    return jsonify(results=results)
+    response = jsonify(results=results)
+    _log_api("search", response.status_code)
+    return response
 
 
 @app.route("/fetch", methods=["GET", "POST"])
@@ -204,6 +296,7 @@ def fetch():
         target_url = request.form.get("url")
 
     if not target_url:
+        _log_api("fetch", 400, "missing url")
         return jsonify(error="missing url"), 400
 
     timeout = float(os.getenv("FETCH_TIMEOUT", "20"))
@@ -222,10 +315,48 @@ def fetch():
             verify=verify,
         )
     except requests.RequestException as exc:
+        _log_api("fetch", 502, "fetch failed")
         return jsonify(error="fetch failed", details=str(exc)), 502
 
     response_headers = {"Content-Type": "text/html; charset=utf-8"}
-    return Response(upstream.text, status=upstream.status_code, headers=response_headers)
+    response = Response(upstream.text, status=upstream.status_code, headers=response_headers)
+    _log_api("fetch", response.status_code)
+    return response
+
+
+@app.route("/sandbox", methods=["GET", "POST"])
+def sandbox():
+    code = request.args.get("code")
+    stdin_data = request.args.get("stdin")
+    timeout = request.args.get("timeout")
+
+    if request.is_json and not code:
+        payload = request.get_json(silent=True) or {}
+        code = payload.get("code")
+        stdin_data = payload.get("stdin")
+        timeout = payload.get("timeout")
+    elif not code:
+        code = request.form.get("code")
+        stdin_data = request.form.get("stdin")
+        timeout = request.form.get("timeout")
+
+    if not code:
+        _log_api("sandbox", 400, "missing code")
+        return jsonify(error="missing code"), 400
+
+    if timeout is None:
+        timeout = float(os.getenv("SANDBOX_TIMEOUT", "5"))
+    else:
+        try:
+            timeout = float(timeout)
+        except (TypeError, ValueError):
+            _log_api("sandbox", 400, "invalid timeout")
+            return jsonify(error="invalid timeout"), 400
+
+    result = _run_python_sandbox(code, stdin_data, timeout)
+    response = jsonify(result)
+    _log_api("sandbox", response.status_code, "timed_out" if result.get("timed_out") else None)
+    return response
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@ Base URL: https://xn--zlvp56j.com
 
 ## Health
 
-- Endpoint: `GET /health`
+- Endpoint: `GET|POST /health`
 - Description: Service health check.
 
 Example:
@@ -58,9 +58,32 @@ Example:
 curl "https://xn--zlvp56j.com/fetch?url=https%3A%2F%2Fexample.com"
 ```
 
+## Sandbox (Python)
+
+- Endpoint: `GET|POST /sandbox`
+- Description: Run Python code in a restricted subprocess for agent use.
+- Query/Form Params:
+  - `code` (required): python source code
+  - `stdin` (optional): stdin content for `input()`
+  - `timeout` (optional): seconds, default 5
+- Response:
+  - `stdout`, `stderr`, `returncode`, `timed_out`
+
+Example:
+```bash
+curl -X POST "https://xn--zlvp56j.com/sandbox" -H "Content-Type: application/json" \
+  -d "{\"code\":\"print('hi')\"}"
+```
+
+## Logging
+
+- Log files are written to `log\{api}.txt` per endpoint.
+- Each line includes timestamp, client IP, method, path, status, and optional detail.
+
 ## Environment Variables
 
 - `HOST` / `PORT`: service bind address and port
 - `PROXY_TIMEOUT`, `PROXY_VERIFY`
 - `SEARCH_TIMEOUT`, `SEARCH_UA`, `SEARCH_RESULTS`
 - `FETCH_TIMEOUT`, `FETCH_VERIFY`, `FETCH_UA`
+- `SANDBOX_TIMEOUT`
