@@ -12,6 +12,8 @@ import sys
 app = Flask(__name__)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(BASE_DIR, "log")
+if not os.getenv("PLAYWRIGHT_BROWSERS_PATH"):
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = os.path.join(BASE_DIR, ".playwright")
 
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -268,18 +270,26 @@ def search():
             _log_api("search", 400, "invalid num_results")
             return jsonify(error="invalid num_results"), 400
 
+    timeout = float(os.getenv("SEARCH_TIMEOUT", "20"))
+    user_agent = os.getenv(
+        "SEARCH_UA",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+    )
     try:
-        timeout = float(os.getenv("SEARCH_TIMEOUT", "20"))
-        user_agent = os.getenv(
-            "SEARCH_UA",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
-        )
         results = _search_with_playwright(query, num_results, timeout, user_agent)
-        if not results:
-            results = google_search(query, num_results=num_results)
     except Exception as exc:
-        _log_api("search", 502, "search request failed")
-        return jsonify(error="search request failed", details=str(exc)), 502
+        try:
+            results = google_search(query, num_results=num_results)
+        except Exception as fallback_exc:
+            _log_api("search", 502, "search request failed")
+            detail = f"{exc} | fallback failed: {fallback_exc}"
+            return jsonify(error="search request failed", details=detail), 502
+    if not results:
+        try:
+            results = google_search(query, num_results=num_results)
+        except Exception as exc:
+            _log_api("search", 502, "search request failed")
+            return jsonify(error="search request failed", details=str(exc)), 502
 
     response = jsonify(results=results)
     _log_api("search", response.status_code)
