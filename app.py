@@ -1,4 +1,5 @@
 from flask import Flask, request, Response, jsonify
+from flask_cors import CORS
 from gsearch.googlesearch import search as google_search
 from urllib.parse import urlparse, parse_qs, quote_plus
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
@@ -10,6 +11,7 @@ import subprocess
 import sys
 
 app = Flask(__name__)
+CORS(app)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(BASE_DIR, "log")
 if not os.getenv("PLAYWRIGHT_BROWSERS_PATH"):
